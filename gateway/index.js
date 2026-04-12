@@ -10,7 +10,7 @@ const wss=new WebSocket.Server({server});
 const PORT=parseInt(process.env.PORT)||4000;
 
 const REPLICAS=[
-    process.env.REPLICA1_URL||"http://replica1:3001",
+  process.env.REPLICA1_URL||"http://replica1:3001",
   process.env.REPLICA2_URL||"http://replica2:3002",
   process.env.REPLICA3_URL||"http://replica3:3003",
 ];
@@ -41,9 +41,8 @@ discoverLeader(); // run immediately on startup
 //WebSocket clients
 const clients = new Set();
 
-function broadcastStroke(stroke, excludeWs = null) {
+function broadcastStroke(stroke) {
   for (const client of clients) {
-    if (client === excludeWs) continue;
     if (client.readyState === WebSocket.OPEN) {
       client.send(JSON.stringify({ type: "stroke", stroke }));
     }
@@ -71,14 +70,9 @@ wss.on("connection", (ws) => {
     }
 
     try {
-      await axios.post(`${currentLeader}/append-entries`, {
-        term: 0,           // real term injected by leader in Day 3
-        leaderId: "gateway-forwarded",
-        entry: stroke,
-        prevLogIndex: -1,
-      });
-      // Keep clients in sync immediately after leader accepts the entry.
-      broadcastStroke(stroke, ws);
+      await axios.post(`${currentLeader}/intake`, {
+        stroke: stroke,
+      }, { timeout: 1000 });
     } catch (err) {
       console.error("[GATEWAY] Failed to reach leader:", err.message);
       currentLeader = null; // force rediscovery
