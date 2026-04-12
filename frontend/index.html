@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mini-RAFT Drawing Board</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a1a; display: flex; flex-direction: column; align-items: center; height: 100vh; }
+    header {
+      width: 100%; padding: 12px 20px;
+      background: #111; color: #eee;
+      display: flex; align-items: center; gap: 16px;
+      font-family: monospace; font-size: 13px;
+    }
+    #status-dot { width: 10px; height: 10px; border-radius: 50%; background: #f55; flex-shrink: 0; }
+    #status-dot.connected { background: #4c4; }
+    canvas {
+      background: #fff;
+      cursor: crosshair;
+      margin-top: 12px;
+      border-radius: 8px;
+    }
+    #color-picker { accent-color: #7f77dd; }
+  </style>
+</head>
+<body>
+  <header>
+    <div id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
+    <span style="margin-left:auto">Color:</span>
+    <input type="color" id="color-picker" value="#7f77dd" />
+    <button onclick="clearCanvas()"
+      style="background:#333;color:#eee;border:1px solid #555;padding:4px 12px;border-radius:6px;cursor:pointer">
+      Clear
+    </button>
+  </header>
+
+  <canvas id="canvas" width="900" height="600"></canvas>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const colorPicker = document.getElementById("color-picker");
+    const statusDot = document.getElementById("status-dot");
+    const statusText = document.getElementById("status-text");
+    
+    //websocket connection
+    const GATEWAY_URL="ws://localhost:4000";
+    let ws;
+    function connect(){
+        ws=new WebSocket(GATEWAY_URL);
+        ws.onopen=()=>{
+            statusDot.classicList.add("connected");
+            statusText.textContent="Connected to gateway";
+        };
+        ws.onclose=()=>{
+            statusDot.classicList.remove("connected");
+            statusText.testContent="Disconnected - reconnecting...";
+            setTimeout(connect,1500);
+        };
+        ws.onerror = () => {
+            statusText.textContent = "Connection error";
+        };
+        ws.onmessage=(event)=>{
+            try{
+                const msg=JSON.parse(event.data);
+                if(msg.type==="stroke"){
+                    drawStroke(msg.stroke,false);
+                }
+            } catch{}
+        };
+    }
+    connect();
+
+    //Drawing logic
+    let drawing=false;
+    let lastX=0;
+    let lastY=0;
+    canvas.addEventListener("mousedown",(e)=>{
+        drawing=true;
+        [lastX,lastY]=[e.offsetX,e.offsetY];
+    });
+    canvas.addEventListener("mousemove", (e) => {
+        if (!drawing) return;
+        const stroke = {
+            x0: lastX, y0: lastY,
+            x1: e.offsetX, y1: e.offsetY,
+            color: colorPicker.value,
+            width: 3,
+        };
+        drawStroke(stroke,true);//draw locally
+        sendStroke(stroke);//send to server
+        [lastX,lastY]=[e.offsetX,e.offsetY];
+    });
+    canvas.addEventListener("mouseup", () => drawing = false);
+    canvas.addEventListener("mouseleave", () => drawing = false);
+
+    function drawStroke(stroke,isLocal){
+        ctx.beginPath();
+        ctx.moveTo(stroke.x0, stroke.y0);
+        ctx.lineTo(stroke.x1, stroke.y1);
+        ctx.strokeStyle = stroke.color || "#000";
+        ctx.lineWidth = stroke.width || 3;
+        ctx.lineCap = "round";
+        ctx.stroke();
+    }
+    function sendStroke(stroke){
+        if(ws && ws.readyState===WebSocket.OPEN){
+            ws.send(JSON.stringify(stroke));
+        }
+    }
+    function clearCanvas(){
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+    }
+    </script>
+</body>
+</html>
