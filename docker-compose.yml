@@ -32,6 +32,7 @@ services:
       - REPLICA_ID=replica1
       - PORT=3001
       - PEERS=http://replica2:3002,http://replica3:3003
+      - GATEWAY_URL=http://gateway:4000
     networks:
       - raft-net
 
@@ -45,6 +46,7 @@ services:
       - REPLICA_ID=replica2
       - PORT=3002
       - PEERS=http://replica1:3001,http://replica3:3003
+      - GATEWAY_URL=http://gateway:4000
     networks:
       - raft-net
 
@@ -58,5 +60,6 @@ services:
       - REPLICA_ID=replica3
       - PORT=3003
       - PEERS=http://replica1:3001,http://replica2:3002
+      - GATEWAY_URL=http://gateway:4000
     networks:
       - raft-net

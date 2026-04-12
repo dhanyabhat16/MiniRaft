@@ -50,12 +50,12 @@
     function connect(){
         ws=new WebSocket(GATEWAY_URL);
         ws.onopen=()=>{
-            statusDot.classicList.add("connected");
+            statusDot.classList.add("connected");
             statusText.textContent="Connected to gateway";
         };
         ws.onclose=()=>{
-            statusDot.classicList.remove("connected");
-            statusText.testContent="Disconnected - reconnecting...";
+            statusDot.classList.remove("connected");
+            statusText.textContent="Disconnected - reconnecting...";
             setTimeout(connect,1500);
         };
         ws.onerror = () => {

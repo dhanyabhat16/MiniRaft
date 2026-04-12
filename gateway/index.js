@@ -11,8 +11,8 @@ const PORT=parseInt(process.env.PORT)||4000;
 
 const REPLICAS=[
     process.env.REPLICA1_URL||"http://replica1:3001",
-    process.env.REPLICA1_URL||"http://replica1:3002",
-    process.env.REPLICA1_URL||"http://replica1:3003",
+  process.env.REPLICA2_URL||"http://replica2:3002",
+  process.env.REPLICA3_URL||"http://replica3:3003",
 ];
 
 //leader discovery
@@ -41,6 +41,15 @@ discoverLeader(); // run immediately on startup
 //WebSocket clients
 const clients = new Set();
 
+function broadcastStroke(stroke, excludeWs = null) {
+  for (const client of clients) {
+    if (client === excludeWs) continue;
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: "stroke", stroke }));
+    }
+  }
+}
+
 wss.on("connection", (ws) => {
   clients.add(ws);
   console.log(`[GATEWAY] Client connected. Total: ${clients.size}`);
@@ -68,6 +77,8 @@ wss.on("connection", (ws) => {
         entry: stroke,
         prevLogIndex: -1,
       });
+      // Keep clients in sync immediately after leader accepts the entry.
+      broadcastStroke(stroke, ws);
     } catch (err) {
       console.error("[GATEWAY] Failed to reach leader:", err.message);
       currentLeader = null; // force rediscovery
@@ -84,12 +95,7 @@ wss.on("connection", (ws) => {
 app.post("/broadcast", (req, res) => {
   const { stroke } = req.body;
   console.log("[GATEWAY] Broadcasting committed stroke to", clients.size, "clients");
-
-  for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "stroke", stroke }));
-    }
-  }
+  broadcastStroke(stroke);
 
   res.json({ ok: true, delivered: clients.size });
 });
