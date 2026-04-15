@@ -1,5 +1,3 @@
-version: "3.9"
-
 networks:
   raft-net:
     driver: bridge
@@ -24,8 +22,6 @@ services:
 
   replica1:
     build: ./replica
-    volumes:
-      - ./replica:/app          # bind mount — edit files → auto-reload
     ports:
       - "3001:3001"
     environment:
@@ -38,8 +34,6 @@ services:
 
   replica2:
     build: ./replica
-    volumes:
-      - ./replica:/app
     ports:
       - "3002:3002"
     environment:
@@ -52,8 +46,6 @@ services:
 
   replica3:
     build: ./replica
-    volumes:
-      - ./replica:/app
     ports:
       - "3003:3003"
     environment:
@@ -61,5 +53,14 @@ services:
       - PORT=3003
       - PEERS=http://replica1:3001,http://replica2:3002
       - GATEWAY_URL=http://gateway:4000
+    networks:
+      - raft-net
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html
     networks:
       - raft-net

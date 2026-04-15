@@ -1,117 +1,360 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="UTF-8"/>
   <title>Mini-RAFT Drawing Board</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #1a1a1a; display: flex; flex-direction: column; align-items: center; height: 100vh; }
-    header {
-      width: 100%; padding: 12px 20px;
-      background: #111; color: #eee;
-      display: flex; align-items: center; gap: 16px;
-      font-family: monospace; font-size: 13px;
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{background:#0f0f0f;font-family:monospace;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+    #topbar{
+      display:flex;align-items:center;gap:16px;padding:10px 16px;
+      background:#1a1a1a;border-bottom:1px solid #2a2a2a;flex-shrink:0;
     }
-    #status-dot { width: 10px; height: 10px; border-radius: 50%; background: #f55; flex-shrink: 0; }
-    #status-dot.connected { background: #4c4; }
-    canvas {
-      background: #fff;
-      cursor: crosshair;
-      margin-top: 12px;
-      border-radius: 8px;
+    #topbar h1{font-size:14px;color:#aaa;font-weight:normal;margin-right:8px}
+    .dot{width:9px;height:9px;border-radius:50%;background:#f55;flex-shrink:0;transition:background .3s}
+    .dot.ok{background:#4c4}
+    #ws-status{font-size:12px;color:#888}
+    #leader-badge{
+      font-size:11px;padding:3px 10px;border-radius:4px;
+      background:#1e3a2e;color:#4c4;border:1px solid #2a5a3a;
     }
-    #color-picker { accent-color: #7f77dd; }
+    .sep{color:#333;font-size:18px}
+
+    #cluster{display:flex;gap:8px;margin-left:auto;align-items:center}
+    .replica-card{
+      font-size:11px;padding:4px 10px;border-radius:4px;
+      background:#1a1a1a;border:1px solid #2a2a2a;color:#666;
+      transition:all .3s;min-width:90px;text-align:center;
+    }
+    .replica-card.leader{background:#1e3a2e;border-color:#2a5a3a;color:#4c4}
+    .replica-card.follower{background:#1a1a2a;border-color:#2a2a4a;color:#66a}
+    .replica-card.candidate{background:#2a2a1a;border-color:#4a4a2a;color:#aa4}
+    .replica-card.dead{background:#1a1a1a;border-color:#333;color:#444;text-decoration:line-through}
+    .rname{font-weight:bold;margin-bottom:2px}
+    .rinfo{color:#555;font-size:10px}
+
+    #toolbar{
+      display:flex;align-items:center;gap:12px;padding:8px 16px;
+      background:#141414;border-bottom:1px solid #222;flex-shrink:0;flex-wrap:wrap;
+    }
+    #toolbar label{font-size:12px;color:#666}
+    input[type=color]{width:32px;height:28px;border:1px solid #333;border-radius:4px;background:none;cursor:pointer;padding:1px}
+    input[type=range]{accent-color:#7f77dd;width:80px}
+    button{
+      background:#222;color:#aaa;border:1px solid #333;
+      padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px;font-family:monospace;
+    }
+    button:hover{background:#2a2a2a;color:#eee}
+    button.danger{border-color:#5a2a2a;color:#c66}
+    button.danger:hover{background:#2a1a1a;color:#f88}
+    #brush-preview{width:20px;height:20px;border-radius:50%;background:#7f77dd;flex-shrink:0;transition:all .2s}
+
+    #canvas-wrap{flex:1;display:flex;justify-content:center;align-items:center;overflow:hidden;padding:12px}
+    canvas{background:#fff;border-radius:6px;cursor:crosshair;max-width:100%;max-height:100%}
+
+    #toast{
+      position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+      background:#222;color:#eee;padding:8px 18px;border-radius:6px;
+      font-size:12px;border:1px solid #333;opacity:0;transition:opacity .3s;pointer-events:none;
+      z-index:100;white-space:nowrap;
+    }
+    #toast.show{opacity:1}
+    #toast.error{border-color:#5a2a2a;color:#f88}
+
+    #pending-indicator{
+      font-size:11px;color:#666;margin-left:4px;
+      transition:color .2s;
+    }
+    #pending-indicator.active{color:#fa0}
   </style>
 </head>
 <body>
-  <header>
-    <div id="status-dot"></div>
-    <span id="status-text">Connecting…</span>
-    <span style="margin-left:auto">Color:</span>
-    <input type="color" id="color-picker" value="#7f77dd" />
-    <button onclick="clearCanvas()"
-      style="background:#333;color:#eee;border:1px solid #555;padding:4px 12px;border-radius:6px;cursor:pointer">
-      Clear
-    </button>
-  </header>
 
-  <canvas id="canvas" width="900" height="600"></canvas>
+<div id="topbar">
+  <h1>mini-raft</h1>
+  <div class="dot" id="ws-dot"></div>
+  <span id="ws-status">Connecting…</span>
+  <span class="sep">|</span>
+  <span id="leader-badge">no leader</span>
+  <div id="cluster">
+    <div class="replica-card" id="card-replica1"><div class="rname">replica1</div><div class="rinfo">—</div></div>
+    <div class="replica-card" id="card-replica2"><div class="rname">replica2</div><div class="rinfo">—</div></div>
+    <div class="replica-card" id="card-replica3"><div class="rname">replica3</div><div class="rinfo">—</div></div>
+  </div>
+</div>
 
-  <script>
-    const canvas = document.getElementById("canvas");
-    const ctx = canvas.getContext("2d");
-    const colorPicker = document.getElementById("color-picker");
-    const statusDot = document.getElementById("status-dot");
-    const statusText = document.getElementById("status-text");
-    
-    //websocket connection
-    const GATEWAY_URL="ws://localhost:4000";
-    let ws;
-    function connect(){
-        ws=new WebSocket(GATEWAY_URL);
-        ws.onopen=()=>{
-            statusDot.classList.add("connected");
-            statusText.textContent="Connected to gateway";
-        };
-        ws.onclose=()=>{
-            statusDot.classList.remove("connected");
-            statusText.textContent="Disconnected - reconnecting...";
-            setTimeout(connect,1500);
-        };
-        ws.onerror = () => {
-            statusText.textContent = "Connection error";
-        };
-        ws.onmessage=(event)=>{
-            try{
-                const msg=JSON.parse(event.data);
-                if(msg.type==="stroke"){
-                    drawStroke(msg.stroke,false);
-                }
-            } catch{}
-        };
-    }
-    connect();
+<div id="toolbar">
+  <label>Color</label>
+  <input type="color" id="color" value="#7f77dd"/>
+  <label>Size</label>
+  <input type="range" id="size" min="1" max="24" value="4"/>
+  <div id="brush-preview"></div>
+  <button onclick="clearCanvas()">Clear</button>
+  <button class="danger" onclick="killLeader()">Kill Leader</button>
+  <span id="stroke-count" style="font-size:11px;color:#555;margin-left:8px">strokes: 0</span>
+  <span id="pending-indicator">●</span>
+</div>
 
-    //Drawing logic
-    let drawing=false;
-    let lastX=0;
-    let lastY=0;
-    canvas.addEventListener("mousedown",(e)=>{
-        drawing=true;
-        [lastX,lastY]=[e.offsetX,e.offsetY];
+<div id="canvas-wrap">
+  <canvas id="canvas" width="1200" height="700"></canvas>
+</div>
+
+<div id="toast"></div>
+
+<script>
+  const canvas   = document.getElementById("canvas");
+  const ctx      = canvas.getContext("2d");
+  const colorEl  = document.getElementById("color");
+  const sizeEl   = document.getElementById("size");
+  const brushPreview    = document.getElementById("brush-preview");
+  const wsDot           = document.getElementById("ws-dot");
+  const wsStatus        = document.getElementById("ws-status");
+  const leaderBadge     = document.getElementById("leader-badge");
+  const strokeCountEl   = document.getElementById("stroke-count");
+  const pendingIndicator= document.getElementById("pending-indicator");
+
+  let strokeCount  = 0;
+  let drawing      = false;
+  let lastX = 0, lastY = 0;
+  let ws;
+  const seenStrokeIds = new Set();
+
+  // ── Pending queue: buffer strokes while WS is not ready ──────────────────
+  let pendingQueue = [];
+  let flushTimer   = null;
+
+  function flushQueue() {
+    if (pendingQueue.length === 0) { setPending(false); return; }
+    if (!ws || ws.readyState !== WebSocket.OPEN) { setPending(true); return; }
+    var toSend = pendingQueue.slice();
+    pendingQueue = [];
+    toSend.forEach(function(s) {
+      ws.send(JSON.stringify(s));
     });
-    canvas.addEventListener("mousemove", (e) => {
-        if (!drawing) return;
-        const stroke = {
-            x0: lastX, y0: lastY,
-            x1: e.offsetX, y1: e.offsetY,
-            color: colorPicker.value,
-            width: 3,
-        };
-        drawStroke(stroke,true);//draw locally
-        sendStroke(stroke);//send to server
-        [lastX,lastY]=[e.offsetX,e.offsetY];
-    });
-    canvas.addEventListener("mouseup", () => drawing = false);
-    canvas.addEventListener("mouseleave", () => drawing = false);
+    setPending(false);
+  }
 
-    function drawStroke(stroke,isLocal){
-        ctx.beginPath();
-        ctx.moveTo(stroke.x0, stroke.y0);
-        ctx.lineTo(stroke.x1, stroke.y1);
-        ctx.strokeStyle = stroke.color || "#000";
-        ctx.lineWidth = stroke.width || 3;
-        ctx.lineCap = "round";
-        ctx.stroke();
-    }
-    function sendStroke(stroke){
-        if(ws && ws.readyState===WebSocket.OPEN){
-            ws.send(JSON.stringify(stroke));
+  function setPending(active) {
+    pendingIndicator.className = active ? "active" : "";
+    pendingIndicator.title     = active ? pendingQueue.length + " strokes pending" : "";
+  }
+
+  // ── Brush preview ─────────────────────────────────────────────────────────
+  function updateBrushPreview() {
+    var s = parseInt(sizeEl.value);
+    var clamped = Math.max(8, s);
+    brushPreview.style.width    = clamped + "px";
+    brushPreview.style.height   = clamped + "px";
+    brushPreview.style.background = colorEl.value;
+  }
+  colorEl.addEventListener("input", updateBrushPreview);
+  sizeEl.addEventListener("input",  updateBrushPreview);
+  updateBrushPreview();
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────
+  var GATEWAY = "ws://" + window.location.hostname + ":4000";
+
+  function connect() {
+    ws = new WebSocket(GATEWAY);
+
+    ws.onopen = function() {
+      wsDot.className = "dot ok";
+      wsStatus.textContent = "Connected";
+      toast("Connected to gateway", false);
+      flushQueue();   // send anything buffered while disconnected
+    };
+
+    ws.onclose = function() {
+      wsDot.className = "dot";
+      wsStatus.textContent = "Disconnected — retrying…";
+      setTimeout(connect, 1500);
+    };
+
+    ws.onerror = function() {
+      wsStatus.textContent = "Connection error";
+    };
+
+    ws.onmessage = function(event) {
+      try {
+        var msg = JSON.parse(event.data);
+        if (msg.type === "stroke") {
+          if (msg.stroke && msg.stroke.id && seenStrokeIds.has(msg.stroke.id)) {
+            return;
+          }
+          if (msg.stroke && msg.stroke.id) {
+            seenStrokeIds.add(msg.stroke.id);
+          }
+          // Only draw remote strokes — local strokes already drawn immediately
+          drawStroke(msg.stroke);
+          strokeCount++;
+          strokeCountEl.textContent = "strokes: " + strokeCount;
         }
+        if (msg.error) {
+          toast("Server: " + msg.error, true);
+        }
+      } catch(e) {}
+    };
+  }
+
+  connect();
+
+  // ── Drawing ───────────────────────────────────────────────────────────────
+  function getPos(e, isTouch) {
+    var r = canvas.getBoundingClientRect();
+    var scaleX = canvas.width  / r.width;
+    var scaleY = canvas.height / r.height;
+    var src = isTouch ? e.touches[0] : e;
+    return {
+      x: (src.clientX - r.left) * scaleX,
+      y: (src.clientY - r.top)  * scaleY,
+    };
+  }
+
+  canvas.addEventListener("mousedown", function(e) {
+    drawing = true;
+    var p = getPos(e, false);
+    lastX = p.x; lastY = p.y;
+  });
+
+  canvas.addEventListener("mousemove", function(e) {
+    if (!drawing) return;
+    var p = getPos(e, false);
+    emitStroke(p.x, p.y);
+  });
+
+  canvas.addEventListener("mouseup",    function() { drawing = false; });
+  canvas.addEventListener("mouseleave", function() { drawing = false; });
+
+  canvas.addEventListener("touchstart", function(e) {
+    e.preventDefault();
+    drawing = true;
+    var p = getPos(e, true);
+    lastX = p.x; lastY = p.y;
+  }, { passive: false });
+
+  canvas.addEventListener("touchmove", function(e) {
+    e.preventDefault();
+    if (!drawing) return;
+    var p = getPos(e, true);
+    emitStroke(p.x, p.y);
+  }, { passive: false });
+
+  canvas.addEventListener("touchend", function() { drawing = false; });
+
+  function emitStroke(x1, y1) {
+    var stroke = {
+      id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + "-" + Math.random().toString(16).slice(2)),
+      x0: Math.round(lastX), y0: Math.round(lastY),
+      x1: Math.round(x1),   y1: Math.round(y1),
+      color: colorEl.value,
+      width: parseInt(sizeEl.value),
+    };
+    seenStrokeIds.add(stroke.id);
+    drawStroke(stroke);   // local draw — instant, no waiting
+    sendStroke(stroke);
+    lastX = x1; lastY = y1;
+  }
+
+  function drawStroke(s) {
+    ctx.beginPath();
+    ctx.moveTo(s.x0, s.y0);
+    ctx.lineTo(s.x1, s.y1);
+    ctx.strokeStyle = s.color || "#000";
+    ctx.lineWidth   = s.width || 3;
+    ctx.lineCap     = "round";
+    ctx.lineJoin    = "round";
+    ctx.stroke();
+  }
+
+  function sendStroke(stroke) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(stroke));
+    } else {
+      // Buffer while disconnected
+      pendingQueue.push(stroke);
+      setPending(true);
+      clearTimeout(flushTimer);
+      flushTimer = setTimeout(flushQueue, 100);
     }
-    function clearCanvas(){
-        ctx.clearRect(0,0,canvas.width,canvas.height);
+  }
+
+  function clearCanvas() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // ── Kill leader helper ────────────────────────────────────────────────────
+  async function killLeader() {
+    try {
+      var res  = await fetch("http://" + window.location.hostname + ":4000/status");
+      var data = await res.json();
+      if (!data.leader) { toast("No leader found", true); return; }
+      var port = data.leader.split(":").pop();
+      var num  = { "3001":"1", "3002":"2", "3003":"3" }[port] || "?";
+      toast("Run in terminal: docker compose stop replica" + num, false);
+    } catch(e) {
+      toast("Could not reach gateway", true);
     }
-    </script>
+  }
+
+  // ── Toast ─────────────────────────────────────────────────────────────────
+  var toastTimer;
+  function toast(msg, isError) {
+    var el = document.getElementById("toast");
+    el.textContent = msg;
+    el.className   = "show" + (isError ? " error" : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function() { el.className = ""; }, 3500);
+  }
+
+  // ── Cluster status polling ────────────────────────────────────────────────
+  var REPLICA_PORTS = { replica1: 3001, replica2: 3002, replica3: 3003 };
+
+  async function pollCluster() {
+    var host = window.location.hostname;
+
+    // Gateway status
+    try {
+      var gres  = await fetch("http://" + host + ":4000/status",
+                    { signal: AbortSignal.timeout(400) });
+      var gdata = await gres.json();
+      if (gdata.leader) {
+        var port = gdata.leader.split(":").pop();
+        var num  = { "3001":"1", "3002":"2", "3003":"3" }[port] || port;
+        leaderBadge.textContent = "leader: replica" + num + " (:" + port + ")";
+        leaderBadge.style.background = "#1e3a2e";
+        leaderBadge.style.color      = "#4c4";
+      } else {
+        leaderBadge.textContent      = "electing…";
+        leaderBadge.style.background = "#2a2a1a";
+        leaderBadge.style.color      = "#aa4";
+      }
+    } catch(e) {
+      leaderBadge.textContent = "gateway unreachable";
+      leaderBadge.style.background = "#2a1a1a";
+      leaderBadge.style.color      = "#f55";
+    }
+
+    // Each replica
+    for (var id in REPLICA_PORTS) {
+      var port = REPLICA_PORTS[id];
+      var card = document.getElementById("card-" + id);
+      try {
+        var r = await fetch("http://" + host + ":" + port + "/status",
+                  { signal: AbortSignal.timeout(400) });
+        var d = await r.json();
+        card.className = "replica-card " + d.role;
+        card.querySelector(".rinfo").textContent =
+          "T" + d.term + "  log:" + d.logLength + "  ci:" + d.commitIndex;
+      } catch(e) {
+        card.className = "replica-card dead";
+        card.querySelector(".rinfo").textContent = "unreachable";
+      }
+    }
+  }
+
+  setInterval(pollCluster, 500);
+  pollCluster();
+</script>
 </body>
 </html>

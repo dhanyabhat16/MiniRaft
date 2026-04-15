@@ -2,12 +2,20 @@ const express=require("express");
 const axios=require("axios");
 const app=express();
 app.use(express.json());
+app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+});
 
 //Node identitiy
 const REPLICA_ID=process.env.REPLICA_ID || "replica1";
 const PORT=parseInt(process.env.PORT) || 3001;
 const PEERS=(process.env.PEERS||"").split(",").filter(Boolean);
 const GATEWAY_URL = process.env.GATEWAY_URL || "http://gateway:4000";
+const SELF_URL = "http://" + REPLICA_ID + ":" + PORT;
 
 //state
 let role="follower";
@@ -15,6 +23,9 @@ let term=0;
 let votedFor=null;
 let strokeLog=[];
 let commitIndex=-1;
+let replicationQueue=Promise.resolve();
+let electionInProgress=false;
+let lastLeaderContactAt=Date.now();
 
 //timers
 let electionTimer=null;
@@ -22,6 +33,9 @@ let heartbeatTimer=null;
 const HEARTBEAT_INTERVAL=150;
 const ELECTION_MIN=500;
 const ELECTION_MAX=800;
+const APPEND_TIMEOUT_MS=1400;
+const PEER_RETRY_COOLDOWN_MS=1200;
+const peerBackoffUntil=new Map();
 
 //better logging
 const rlog=(...args)=>console.log(`[${REPLICA_ID}][T${term}][${role.toUpperCase()}]`,...args);
@@ -43,6 +57,10 @@ function stopHeartbeatTimer(){
     heartbeatTimer=null;
 }
 
+function markLeaderContact() {
+    lastLeaderContactAt = Date.now();
+}
+
 //Roles
 function becomeFollower(newTerm){
     rlog("-> FOLLOWER (new term "+newTerm+")");
@@ -50,7 +68,7 @@ function becomeFollower(newTerm){
     term=newTerm;
     votedFor=null;
     stopHeartbeatTimer();
-    stopElectionTimer();
+    resetElectionTimer(); 
 }
 function becomeLeader(){
     rlog("-> LEADER elected");
@@ -62,36 +80,44 @@ function becomeLeader(){
 
 //election logic 
 async function startElection(){
+    if (role === "leader" || electionInProgress) {
+        return;
+    }
+    electionInProgress = true;
     role="candidate";
     term+=1;
     votedFor=REPLICA_ID;
     let votes=1;
     rlog("Starting election");
-    await Promise.all(
-        PEERS.map(async(peer)=>{
-            try{
-                const res=await axios.post(peer+"/request-vote",{term:term,candidateId:REPLICA_ID,},{timeout:300});
-                //Higher term: step down
-                if (res.data.term>term){
-                    becomeFollower(res.data.term);
-                    return;
-                }
-                if(res.data.voteGranted){
-                    votes++;
-                    rlog("Vote from",peer,"| total:",votes);
-                    if(votes>=2 && role=="candidate"){
-                        becomeLeader();
+    try {
+        await Promise.all(
+            PEERS.map(async(peer)=>{
+                try{
+                    const res=await axios.post(peer+"/request-vote",{term:term,candidateId:REPLICA_ID,},{timeout:300});
+                    //Higher term: step down
+                    if (res.data.term>term){
+                        becomeFollower(res.data.term);
+                        return;
                     }
+                    if(res.data.voteGranted){
+                        votes++;
+                        rlog("Vote from",peer,"| total:",votes);
+                        if(votes>=2 && role=="candidate"){
+                            becomeLeader();
+                        }
+                    }
+                } catch(e){
+                    rlog("Vote requested failed to"+peer);
                 }
-            } catch(e){
-                rlog("Vote requested failed to"+peer);
-            }
-        })
-    );
-    //split vote case
-    if(role=="candidate"){
-        rlog("Split vote - retrying");
-        resetElectionTimer();
+            })
+        );
+        //split vote case
+        if(role=="candidate"){
+            rlog("Split vote - retrying");
+            resetElectionTimer();
+        }
+    } finally {
+        electionInProgress = false;
     }
 }
 //Heartbeats
@@ -103,6 +129,7 @@ async function sendHeartbeats(){
                 {
                     term:term,
                     leaderId:REPLICA_ID,
+                    leaderUrl:SELF_URL,
                 },
                 {timeout:300}
             );
@@ -116,47 +143,133 @@ async function sendHeartbeats(){
 }
 //replication
 async function replicateEntry(entry){
+    if(role!=="leader"){
+        return false;
+    }
     const index=strokeLog.length;
     strokeLog.push({entry,term,committed:false});
-    rlog("Appended entry at index "+index);
+    rlog("Appended entry at index "+index+", replicating...");
     let acks=1;
-    await Promise.all(
-        PEERS.map(async(peer)=>{
+    let quorumSatisfied=false;
+    const quorumReached = await new Promise((resolve)=>{
+        let resolved=false;
+        let pending=PEERS.length;
+        const done=(ok)=>{
+            if(!resolved){
+                resolved=true;
+                if(ok){
+                    quorumSatisfied=true;
+                }
+                resolve(ok);
+            }
+        };
+        const markPeerFinished=()=>{
+            pending--;
+            if(!resolved && pending===0){
+                done(acks>=2);
+            }
+        };
+
+        PEERS.forEach(async(peer)=>{
+            const backoffUntil=peerBackoffUntil.get(peer)||0;
+            if(backoffUntil>Date.now()){
+                markPeerFinished();
+                return;
+            }
+            const appendPayload={
+                term,
+                leaderId:REPLICA_ID,
+                entry,
+                prevLogIndex:index-1,
+                entryIndex:index,
+                leaderCommitIndex: commitIndex,
+            };
+            const sendAppendWithRetry=async()=>{
+                let lastErr=null;
+                for(let attempt=1;attempt<=2;attempt++){
+                    try{
+                        return await axios.post(peer+"/append-entries",appendPayload,{timeout:APPEND_TIMEOUT_MS});
+                    } catch(err){
+                        lastErr=err;
+                        if(attempt<2){
+                            await new Promise(r=>setTimeout(r,120));
+                        }
+                    }
+                }
+                throw lastErr;
+            };
             try{
-                const res=await axios.post(peer+"/append-entries",{
-                    term:term,
-                    leaderId:REPLICA_ID,
-                    entry,
-                    prevLogIndex:index-1,
-                    entryIndex:index,
-                },{timeout:500});
+                const res=await sendAppendWithRetry();
                 if(res.data.term>term){
                     becomeFollower(res.data.term);
+                    done(false);
                     return;
                 }
                 if(res.data.success){
+                    peerBackoffUntil.delete(peer);
                     acks++;
-                    rlog("ACK from",peer,"| total:",acks);
+                    if(!quorumSatisfied){
+                        rlog("ACK from",peer,"| total:",acks);
+                    }
+                    if(acks>=2){
+                        done(true);
+                    }
                 } else if(res.data.logLength!==undefined){
+                    if(quorumSatisfied){
+                        return;
+                    }
                     await syncFollower(peer, res.data.logLength);
+                    const retry=await sendAppendWithRetry();
+                    if(retry.data && retry.data.success){
+                        peerBackoffUntil.delete(peer);
+                        acks++;
+                        if(!quorumSatisfied){
+                            rlog("ACK after sync from",peer,"| total:",acks);
+                        }
+                        if(acks>=2){
+                            done(true);
+                        }
+                    }
                 }
             } catch(e){
-                rlog("Replication failed to "+peer);
+                peerBackoffUntil.set(peer,Date.now()+PEER_RETRY_COOLDOWN_MS);
+                if(!quorumSatisfied){
+                    rlog("Replication failed to "+peer);
+                }
+            } finally{
+                markPeerFinished();
             }
-        })
-    );
-    if(acks>=2){
+        });
+    });
+    if(quorumReached){
         strokeLog[index].committed=true;
         commitIndex=index;
         rlog("Committed index "+index);
-        try{
-            await axios.post(GATEWAY_URL+"/broadcast",{stroke:entry});
-        } catch(e){
+        axios.post(
+            GATEWAY_URL+"/broadcast",
+            {stroke:entry,index},
+            {timeout:1000}
+        ).catch(()=>{
             rlog("Gateway notify failed");
-        }
+        });
+        return true;
     } else{
         rlog("Commit failed - insufficient ACKs: ",acks);
+        return false;
     }
+}
+
+function enqueueReplication(entry){
+    replicationQueue = replicationQueue
+        .then(async()=>{
+            if(role!=="leader") return false;
+            return replicateEntry(entry);
+        })
+        .catch((e)=>{
+            rlog("Replication queue error:", e && e.message ? e.message : e);
+            return false;
+        });
+    return replicationQueue;
 }
 async function syncFollower(peer, fromIndex) {
   const missing = strokeLog.slice(fromIndex).filter(e => e.committed);
@@ -169,6 +282,31 @@ async function syncFollower(peer, fromIndex) {
   } catch (e) {
     rlog("Sync failed to " + peer);
   }
+}
+
+async function catchUpFromLeader(leaderUrl) {
+    if (!leaderUrl) return;
+    try {
+        const fromIndex = strokeLog.length;
+        const res = await axios.get(leaderUrl + "/sync-log", {
+            params: { from: fromIndex },
+            timeout: 500,
+        });
+        const entries = (res.data && res.data.entries) || [];
+        if (!entries.length) return;
+
+        entries.forEach((item, i) => {
+            strokeLog[fromIndex + i] = {
+                entry: item.entry,
+                term: item.term,
+                committed: true,
+            };
+        });
+        commitIndex = Math.max(commitIndex, fromIndex + entries.length - 1);
+        rlog("Caught up", entries.length, "entries from leader");
+    } catch (e) {
+        rlog("Catch-up failed from leader");
+    }
 }
 
 //RPC endpoints
@@ -188,7 +326,8 @@ app.post("/request-vote",(req,res)=>{
 });
 
 app.post("/heartbeat",(req,res)=>{
-    const{term:leaderTerm}=req.body;
+    const{term:leaderTerm, leaderUrl}=req.body;
+    markLeaderContact();
     if(leaderTerm>term){
         becomeFollower(leaderTerm);
     } else if(leaderTerm===term){
@@ -198,23 +337,33 @@ app.post("/heartbeat",(req,res)=>{
             resetElectionTimer(); //refresh
         }
     }
+    if (leaderTerm >= term) {
+        catchUpFromLeader(leaderUrl);
+    }
     res.json({success:true,term});
 });
 
 app.post("/append-entries",(req,res)=>{
-    const { term: leaderTerm, entry, prevLogIndex, entryIndex } = req.body;
-    if(leaderTerm<term){
-        return res.json({success:false,term});
+    const { term: leaderTerm, entry, prevLogIndex, entryIndex, leaderCommitIndex } = req.body;
+    if(leaderTerm < term){
+        return res.json({success:false, term});
     }
-    if(leaderTerm>term) becomeFollower(leaderTerm);
-    resetElectionTimer();
-    if(prevLogIndex>=0 && strokeLog.length<=prevLogIndex){
-        return res.json({success:false,logLength:strokeLog.length});
+    if(leaderTerm > term) becomeFollower(leaderTerm);
+    else resetElectionTimer();
+
+    if(prevLogIndex >= 0 && strokeLog.length <= prevLogIndex){
+        return res.json({success:false, logLength:strokeLog.length});
     }
-    if(entry){
-        strokeLog[entryIndex]={entry,term:leaderTerm,committed:false};
+    if(entry !== undefined && entryIndex !== undefined){
+        strokeLog[entryIndex] = {entry, term:leaderTerm, committed:false};
     }
-    res.json({success:true,logLength:strokeLog.length,term});
+    if(leaderCommitIndex !== undefined && leaderCommitIndex >= 0){
+        for(let i = 0; i <= leaderCommitIndex && i < strokeLog.length; i++){
+            if(strokeLog[i]) strokeLog[i].committed = true;
+        }
+        commitIndex = Math.min(leaderCommitIndex, strokeLog.length - 1);
+    }
+    res.json({success:true, logLength:strokeLog.length, term});
 });
 
 app.post("/sync-log",(req,res)=>{
@@ -232,7 +381,17 @@ app.post("/sync-log",(req,res)=>{
 
 app.get("/sync-log",(req,res)=>{
     const fromIndex=parseInt(req.query.from)||0;
-    const missing = strokeLog.slice(fromIndex).filter(e=>e.committed);
+    const missing=[];
+    for(let i=fromIndex;i<strokeLog.length;i++){
+        const item=strokeLog[i];
+        if(item && item.committed){
+            missing.push({
+                index:i,
+                entry:item.entry,
+                term:item.term,
+            });
+        }
+    }
     res.json({entries:missing});
 });
 
@@ -240,8 +399,8 @@ app.post("/intake", async (req,res)=>{
     if (role!=="leader"){
         return res.status(400).json({error:"Not leader"});
     }
-    await replicateEntry(req.body.stroke);
-    res.json({ok:true,commitIndex});
+    enqueueReplication(req.body.stroke);
+    res.json({ok:true,accepted:true,queued:true,commitIndex});
 });
 
 app.get("/status",(req,res)=>{
