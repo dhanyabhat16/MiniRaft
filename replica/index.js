@@ -24,8 +24,11 @@ let votedFor=null;
 let strokeLog=[];
 let commitIndex=-1;
 let replicationQueue=Promise.resolve();
+const pendingCommitEntries=[];
+let pendingRetryRunning=false;
 let electionInProgress=false;
 let lastLeaderContactAt=Date.now();
+let catchUpInFlight=false;
 
 //timers
 let electionTimer=null;
@@ -33,9 +36,14 @@ let heartbeatTimer=null;
 const HEARTBEAT_INTERVAL=150;
 const ELECTION_MIN=500;
 const ELECTION_MAX=800;
+const STARTUP_ELECTION_GRACE_MS=2500;
+const PRE_ELECTION_PROBE_TIMEOUT_MS=250;
 const APPEND_TIMEOUT_MS=1400;
-const PEER_RETRY_COOLDOWN_MS=1200;
+const PEER_RETRY_COOLDOWN_MS=350;
+const PEER_BACKOFF_FAIL_STREAK=3;
 const peerBackoffUntil=new Map();
+const peerFailureStreak=new Map();
+const processStartedAt=Date.now();
 
 //better logging
 const rlog=(...args)=>console.log(`[${REPLICA_ID}][T${term}][${role.toUpperCase()}]`,...args);
@@ -61,6 +69,70 @@ function markLeaderContact() {
     lastLeaderContactAt = Date.now();
 }
 
+async function discoverExistingLeaderFromPeers(){
+    const results=await Promise.allSettled(
+        PEERS.map(peer=>
+            axios.get(peer+"/status",{timeout:PRE_ELECTION_PROBE_TIMEOUT_MS})
+                .then(res=>({peer,data:res.data}))
+                .catch(()=>null)
+        )
+    );
+
+    let found=null;
+    for(const r of results){
+        if(r.status==="fulfilled" && r.value && r.value.data && r.value.data.role==="leader"){
+            const candidate={
+                peer:r.value.peer,
+                term:typeof r.value.data.term==="number" ? r.value.data.term : term,
+            };
+            if(!found || candidate.term>found.term){
+                found=candidate;
+            }
+        }
+    }
+    if(!found) return false;
+
+    if(found.term>term){
+        becomeFollower(found.term);
+    } else if(role!=="follower"){
+        role="follower";
+        votedFor=null;
+        stopHeartbeatTimer();
+    }
+    markLeaderContact();
+    resetElectionTimer();
+    return true;
+}
+
+function schedulePendingRetry(){
+    if(role!=="leader" || !pendingCommitEntries.length) return;
+    setTimeout(()=>{
+        retryPendingCommits();
+    },300);
+}
+
+async function retryPendingCommits(){
+    if(pendingRetryRunning || role!=="leader") return;
+    pendingRetryRunning=true;
+    try{
+        while(role==="leader" && pendingCommitEntries.length){
+            const nextEntry=pendingCommitEntries[0];
+            const committed=await replicateEntry(nextEntry);
+            if(committed){
+                pendingCommitEntries.shift();
+            } else{
+                // Quorum still unavailable; keep buffered order and try later.
+                break;
+            }
+        }
+    } finally{
+        pendingRetryRunning=false;
+        if(role==="leader" && pendingCommitEntries.length){
+            schedulePendingRetry();
+        }
+    }
+}
+
 //Roles
 function becomeFollower(newTerm){
     rlog("-> FOLLOWER (new term "+newTerm+")");
@@ -76,11 +148,27 @@ function becomeLeader(){
     stopElectionTimer();
     sendHeartbeats();
     heartbeatTimer=setInterval(sendHeartbeats,HEARTBEAT_INTERVAL);
+    schedulePendingRetry();
 }
 
 //election logic 
 async function startElection(){
     if (role === "leader" || electionInProgress) {
+        return;
+    }
+    const inStartupGrace=(Date.now()-processStartedAt)<STARTUP_ELECTION_GRACE_MS;
+    if(inStartupGrace){
+        const foundLeader=await discoverExistingLeaderFromPeers();
+        if(foundLeader){
+            return;
+        }
+        // Preserve stable leader during restart churn.
+        resetElectionTimer();
+        return;
+    }
+    // Even after grace, probe once before campaigning.
+    const foundLeader=await discoverExistingLeaderFromPeers();
+    if(foundLeader){
         return;
     }
     electionInProgress = true;
@@ -146,6 +234,12 @@ async function replicateEntry(entry){
     if(role!=="leader"){
         return false;
     }
+    // Trim any stale uncommitted tail from earlier quorum-loss windows.
+    // Otherwise followers that rejoin later can reject new appends forever
+    // due to prevLogIndex mismatch against these never-committed entries.
+    while(strokeLog.length>0 && !strokeLog[strokeLog.length-1].committed){
+        strokeLog.pop();
+    }
     const index=strokeLog.length;
     strokeLog.push({entry,term,committed:false});
     rlog("Appended entry at index "+index+", replicating...");
@@ -206,6 +300,7 @@ async function replicateEntry(entry){
                     return;
                 }
                 if(res.data.success){
+                    peerFailureStreak.set(peer,0);
                     peerBackoffUntil.delete(peer);
                     acks++;
                     if(!quorumSatisfied){
@@ -221,6 +316,7 @@ async function replicateEntry(entry){
                     await syncFollower(peer, res.data.logLength);
                     const retry=await sendAppendWithRetry();
                     if(retry.data && retry.data.success){
+                        peerFailureStreak.set(peer,0);
                         peerBackoffUntil.delete(peer);
                         acks++;
                         if(!quorumSatisfied){
@@ -232,7 +328,12 @@ async function replicateEntry(entry){
                     }
                 }
             } catch(e){
-                peerBackoffUntil.set(peer,Date.now()+PEER_RETRY_COOLDOWN_MS);
+                const streak=(peerFailureStreak.get(peer)||0)+1;
+                peerFailureStreak.set(peer,streak);
+                if(streak>=PEER_BACKOFF_FAIL_STREAK){
+                    peerBackoffUntil.set(peer,Date.now()+PEER_RETRY_COOLDOWN_MS);
+                    peerFailureStreak.set(peer,0);
+                }
                 if(!quorumSatisfied){
                     rlog("Replication failed to "+peer);
                 }
@@ -254,6 +355,11 @@ async function replicateEntry(entry){
         });
         return true;
     } else{
+        // Roll back the failed tail append so leader log only keeps committed
+        // prefix; this keeps rejoining follower sync straightforward.
+        if(strokeLog.length-1===index && strokeLog[index] && !strokeLog[index].committed){
+            strokeLog.pop();
+        }
         rlog("Commit failed - insufficient ACKs: ",acks);
         return false;
     }
@@ -263,7 +369,12 @@ function enqueueReplication(entry){
     replicationQueue = replicationQueue
         .then(async()=>{
             if(role!=="leader") return false;
-            return replicateEntry(entry);
+            const committed=await replicateEntry(entry);
+            if(!committed){
+                pendingCommitEntries.push(entry);
+                schedulePendingRetry();
+            }
+            return committed;
         })
         .catch((e)=>{
             rlog("Replication queue error:", e && e.message ? e.message : e);
@@ -272,7 +383,17 @@ function enqueueReplication(entry){
     return replicationQueue;
 }
 async function syncFollower(peer, fromIndex) {
-  const missing = strokeLog.slice(fromIndex).filter(e => e.committed);
+  const missing=[];
+  for(let i=fromIndex;i<strokeLog.length;i++){
+    const item=strokeLog[i];
+    if(item && item.committed){
+      missing.push({
+        index:i,
+        entry:item.entry,
+        term:item.term,
+      });
+    }
+  }
 
   try {
     await axios.post(peer + "/sync-log", {
@@ -285,27 +406,53 @@ async function syncFollower(peer, fromIndex) {
 }
 
 async function catchUpFromLeader(leaderUrl) {
-    if (!leaderUrl) return;
+    if (!leaderUrl || catchUpInFlight) return;
+    catchUpInFlight=true;
     try {
-        const fromIndex = strokeLog.length;
-        const res = await axios.get(leaderUrl + "/sync-log", {
-            params: { from: fromIndex },
-            timeout: 500,
-        });
+        // Recover from the last committed point, not raw log length.
+        // On restarts/failovers, length may include stale uncommitted tail.
+        const fromIndex = Math.max(0, commitIndex + 1);
+        let res=null;
+        let lastErr=null;
+        for(let attempt=1;attempt<=2;attempt++){
+            try{
+                res = await axios.get(leaderUrl + "/sync-log", {
+                    params: { from: fromIndex },
+                    timeout: 1200,
+                });
+                break;
+            } catch(err){
+                lastErr=err;
+                if(attempt<2){
+                    await new Promise(r=>setTimeout(r,150));
+                }
+            }
+        }
+        if(!res){
+            throw lastErr || new Error("sync-log unavailable");
+        }
         const entries = (res.data && res.data.entries) || [];
         if (!entries.length) return;
 
         entries.forEach((item, i) => {
-            strokeLog[fromIndex + i] = {
+            const targetIndex=(typeof item.index==="number") ? item.index : (fromIndex + i);
+            strokeLog[targetIndex] = {
                 entry: item.entry,
                 term: item.term,
                 committed: true,
             };
         });
-        commitIndex = Math.max(commitIndex, fromIndex + entries.length - 1);
+        for(let i=strokeLog.length-1;i>=0;i--){
+            if(strokeLog[i] && strokeLog[i].committed){
+                commitIndex=Math.max(commitIndex,i);
+                break;
+            }
+        }
         rlog("Caught up", entries.length, "entries from leader");
     } catch (e) {
         rlog("Catch-up failed from leader");
+    } finally{
+        catchUpInFlight=false;
     }
 }
 
@@ -369,13 +516,19 @@ app.post("/append-entries",(req,res)=>{
 app.post("/sync-log",(req,res)=>{
     const{entries,fromIndex}=req.body;
     entries.forEach((item,i)=>{
-        strokeLog[fromIndex+i]={
+        const targetIndex=(typeof item.index==="number") ? item.index : (fromIndex+i);
+        strokeLog[targetIndex]={
             entry:item.entry,
             term:item.term,
             committed:true,
         };
     });
-    commitIndex=strokeLog.filter(e=>e && e.committed).length-1;
+    for(let i=strokeLog.length-1;i>=0;i--){
+        if(strokeLog[i] && strokeLog[i].committed){
+            commitIndex=i;
+            break;
+        }
+    }
     res.json({ok:true});
 });
 
